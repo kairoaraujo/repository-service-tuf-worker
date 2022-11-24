@@ -381,11 +381,7 @@ class MetadataRepository:
 
         for role_name, data in metadata.items():
             metadata = Metadata.from_dict(data)
-            metadata.to_file(
-                f"{role_name}.json",
-                JSONSerializer(),
-                self._storage_backend,
-            )
+            self._persist(metadata, role_name)
             logging.debug(f"{role_name}.json saved")
 
         result = ResultDetails(
