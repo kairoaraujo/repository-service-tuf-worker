@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import redis
+from pottery import RedisDict, Redlock
 from securesystemslib.exceptions import StorageError  # type: ignore
 from securesystemslib.signer import SSlibSigner  # type: ignore
 from tuf.api.metadata import (  # noqa
@@ -93,6 +94,12 @@ class MetadataRepository:
         self._storage_backend = self.refresh_settings().STORAGE
         self._key_storage_backend = self.refresh_settings().KEYVAULT
         self._redis = redis.StrictRedis.from_url(worker_settings.REDIS_SERVER)
+        self._redis_md = redis.StrictRedis.from_url(
+            worker_settings.REDIS_SERVER,
+            db=1,
+            encoding="utf-8",
+            decode_responses=True,
+        )
         self._hours_before_expire: int = self._settings.get_fresh(
             "HOURS_BEFORE_EXPIRE", 1
         )
@@ -197,7 +204,7 @@ class MetadataRepository:
         self._worker_settings = settings
         return settings
 
-    def _load(self, role_name: str) -> Metadata:
+    def _load_old(self, role_name: str) -> Metadata:
         """
         Loads latest version of metadata for rolename using configured storage
         backend.
@@ -206,6 +213,28 @@ class MetadataRepository:
         filenames and figure out the latest version.
         """
         return Metadata.from_file(role_name, None, self._storage_backend)
+
+    def _save(self, role: Metadata, role_name: str):
+        if self._redis_md.exists(role_name) is 0:
+            role_metadata = RedisDict(
+                role.to_dict(), redis=self._redis_md, key=role_name
+            )
+
+            return role_metadata
+        else:
+            role_metadata = RedisDict(redis=self._redis_md, key=role_name)
+            role_metadata["signed"] = role.signed.to_dict()
+            role_metadata["signatures"] = role.signatures.to_dict()
+
+    def _load(self, role_name: str) -> Metadata:
+            if self._redis_md.exists(role_name) == 1:
+                metadata = Metadata.from_dict(
+                    RedisDict(redis=self._redis_md, key=role_name).to_dict()
+                )
+                return metadata
+
+            else:
+                raise KeyError(f"Cannot load {role_name}")
 
     def _sign(self, role: Metadata, role_name: str) -> None:
         """
@@ -262,7 +291,8 @@ class MetadataRepository:
         self._bump_version(timestamp)
         self._bump_expiry(timestamp, Timestamp.type)
         self._sign(timestamp, Timestamp.type)
-        self._persist(timestamp, Timestamp.type)
+        self._save(timestamp, Timestamp.type)
+        #self._persist(timestamp, Timestamp.type)
 
         return timestamp
 
@@ -282,7 +312,8 @@ class MetadataRepository:
         self._bump_expiry(snapshot, Snapshot.type)
         self._bump_version(snapshot)
         self._sign(snapshot, Snapshot.type)
-        self._persist(snapshot, Snapshot.type)
+        self._save(snapshot, Snapshot.type)
+        #self._persist(snapshot, Snapshot.type)
 
         return snapshot.signed.version
 
@@ -380,8 +411,21 @@ class MetadataRepository:
             raise (ValueError("No metadata in the payload"))
 
         for role_name, data in metadata.items():
-            metadata = Metadata.from_dict(data)
-            self._persist(metadata, role_name)
+            if "." in role_name:
+                metadata_name = role_name.split(".")[1]
+            else:
+                metadata_name = role_name
+
+            new_metadata = Metadata.from_dict(data)
+
+            try:
+                md_role = self._load(metadata_name)
+                if new_metadata.signed.version > md_role.signed.version:
+                    self._save(new_metadata, metadata_name)
+            except KeyError:
+                self._save(new_metadata, metadata_name)
+
+            self._persist(new_metadata, role_name)
             logging.debug(f"{role_name}.json saved")
 
         result = ResultDetails(
@@ -407,24 +451,26 @@ class MetadataRepository:
         if targets is None:
             raise ValueError("No targets in the payload")
 
-        with self._redis.lock("TUF_BINS_HASHED"):
-            # Group target files by responsible 'bins' roles
-            bin_target_groups: Dict[str, List[TargetFile]] = {}
-            for target in targets:
-                bins_name = self._get_path_succinct_role(target.get("path"))
-                if bins_name not in bin_target_groups:
-                    bin_target_groups[bins_name] = []
+        # Group target files by responsible 'bins' roles
+        bin_target_groups: Dict[str, List[TargetFile]] = {}
+        for target in targets:
+            bins_name = self._get_path_succinct_role(target.get("path"))
+            if bins_name not in bin_target_groups:
+                bin_target_groups[bins_name] = []
 
-                target_file = TargetFile.from_dict(
-                    target["info"], target["path"]
-                )
-                bin_target_groups[bins_name].append(target_file)
+            target_file = TargetFile.from_dict(
+                target["info"], target["path"]
+            )
+            bin_target_groups[bins_name].append(target_file)
 
-            # Update target file info in responsible 'bins' roles, bump
-            # version and expiry and sign and persist
-            targets_meta = []
-            for bins_name, target_files in bin_target_groups.items():
-                logging.debug(f"Adding targets to {bins_name}")
+        # Update target file info in responsible 'bins' roles, bump
+        # version and expiry and sign and persist
+        targets_meta = []
+        for bins_name, target_files in bin_target_groups.items():
+            logging.debug(f"Adding targets to {bins_name}")
+            with Redlock(
+                key=bins_name, masters={self._redis_md}, auto_release_time=3
+            ):
                 bins_role = self._load(bins_name)
                 for target_file in target_files:
                     bins_role.signed.targets[target_file.path] = target_file
@@ -432,7 +478,8 @@ class MetadataRepository:
                 self._bump_expiry(bins_role, BINS)
                 self._bump_version(bins_role)
                 self._sign(bins_role, BINS)
-                self._persist(bins_role, bins_name)
+                self._save(bins_role,)
+                #self._persist(bins_role, bins_name)
 
                 targets_meta.append((bins_name, bins_role.signed.version))
 
@@ -562,7 +609,7 @@ class MetadataRepository:
         """
         try:
             bin = self._load(BIN)
-        except StorageError:
+        except KeyError:
             logging.error(f"{BIN} not found, not bumping.")
             return False
 
@@ -577,6 +624,7 @@ class MetadataRepository:
                 self._bump_expiry(bins_role, BINS)
                 self._bump_version(bins_role)
                 self._sign(bins_role, BINS)
+                self._save(bins_role, BINS)
                 self._persist(bins_role, bins_name)
                 targets_meta.append((bins_name, bins_role.signed.version))
 
@@ -648,7 +696,7 @@ class MetadataRepository:
 
     def bump_online_roles(self) -> bool:
         """Bump online Roles (Snapshot, Timestamp, BINS)."""
-        with self._redis.lock("TUF_SNAPSHOT_TIMESTAMP"):
+        with self._redis.lock("TUF_ONLINE_ROLES"):
             if self._settings.get_fresh("BOOTSTRAP") is None:
                 logging.info(
                     "[automatic_version_bump] No bootstrap, skipping..."
