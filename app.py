@@ -69,13 +69,19 @@ app = Celery(
 
 @app.task(serializer="json", bind=True)
 def repository_service_tuf_worker(
-    self, action: str, payload: Optional[Dict[str, Any]] = None
+    self,
+    action: str,
+    payload: Optional[Dict[str, Any]] = None,
+    refresh_settings: Optional[bool] = True,
 ):
     """
     Repository Service for TUF Metadata Worker
     """
-    repository.refresh_settings(worker_settings)
+    if refresh_settings is True:
+        repository.refresh_settings(worker_settings)
+
     repository_action = getattr(repository, action)
+
     if payload is None:
         result = repository_action()
     else:
@@ -140,18 +146,18 @@ app.conf.beat_schedule = {
             "acks_late": True,
         },
     },
-    "publish_targets": {
-        "task": "app.repository_service_tuf_worker",
-        "schedule": schedules.crontab(minute="*/1"),
-        "kwargs": {
-            "action": "publish_targets",
-        },
-        "options": {
-            "task_id": "publish_targets",
-            "queue": "rstuf_internals",
-            "acks_late": True,
-        },
-    },
+    # "publish_targets": {
+    #     "task": "app.repository_service_tuf_worker",
+    #     "schedule": schedules.crontab(minute="*/10"),
+    #     "kwargs": {
+    #         "action": "publish_targets",
+    #     },
+    #     "options": {
+    #         "task_id": "publish_targets",
+    #         "queue": "rstuf_internals",
+    #         "acks_late": True,
+    #     },
+    # },
 }
 
 repository = MetadataRepository.create_service()
