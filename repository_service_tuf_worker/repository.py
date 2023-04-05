@@ -8,7 +8,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import redis
 from celery.app.task import Task
@@ -25,6 +25,7 @@ from tuf.api.metadata import (  # noqa
     Targets,
     Timestamp,
 )
+from tuf.api.exceptions import BadVersionNumberError
 from tuf.api.serialization.json import JSONSerializer
 
 # the 'service import is used to retrieve sublcasses (Implemented Services)
@@ -615,7 +616,7 @@ class MetadataRepository:
         logging.debug(f"Delete targets. {result}")
         return asdict(result)
 
-    def bump_bins_roles(self) -> bool:
+    def bump_bins_roles(self, force: Optional[bool] = False) -> bool:
         """
         Bumps version and expiration date of 'bins' role metadata (multiple).
 
@@ -637,7 +638,7 @@ class MetadataRepository:
             bins_role: Metadata[Targets] = self._storage_backend.get(bins_name)
 
             if (bins_role.signed.expires - datetime.now()) < timedelta(
-                hours=self._hours_before_expire
+                hours=self._hours_before_expire or force is True
             ):
                 self._bump_expiry(bins_role, BINS)
                 self._bump_version(bins_role)
@@ -671,7 +672,7 @@ class MetadataRepository:
 
         return True
 
-    def bump_snapshot(self) -> bool:
+    def bump_snapshot(self, force: Optional[bool] = False) -> bool:
         """
         Bumps version and expiration date of TUF 'snapshot' role metadata.
 
@@ -689,7 +690,7 @@ class MetadataRepository:
             return False
 
         if (snapshot.signed.expires - datetime.now()) < timedelta(
-            hours=self._hours_before_expire
+            hours=self._hours_before_expire or force is True
         ):
             timestamp = self._update_timestamp(self._update_snapshot([]))
             logging.info(
@@ -711,7 +712,7 @@ class MetadataRepository:
 
         return True
 
-    def bump_online_roles(self) -> bool:
+    def bump_online_roles(self, force: Optional[bool] = False) -> bool:
         """Bump online Roles (Snapshot, Timestamp, BINS)."""
         with self._redis.lock("TUF_SNAPSHOT_TIMESTAMP"):
             if self._settings.get_fresh("BOOTSTRAP") is None:
@@ -720,7 +721,33 @@ class MetadataRepository:
                 )
                 return False
 
-            self.bump_snapshot()
-            self.bump_bins_roles()
+            self.bump_snapshot(force=force)
+            self.bump_bins_roles(force=force)
 
             return True
+
+    def key_rotation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = payload.get("metadata")
+        if metadata is None:
+            KeyError("No 'metadata' in the payload")
+
+        old_root: Metadata[Root] = self._storage_backend.get(Root.type)
+        new_root: Metadata[Root] = Metadata.from_dict(payload["metadata"])
+        old_root_online_keys = old_root.signed.roles[Timestamp.type].keyids
+        new_root_online_keys = new_root.signed.roles[Timestamp.type].keyids
+
+        if old_root.signed.version + 1 != new_root.signed.version:
+            raise BadVersionNumberError(
+                f"New root version not expected {new_root.signed.version}"
+            )
+
+        # Only root keys are rotated
+        if old_root_online_keys == new_root_online_keys:
+                self._persist(new_root, Root.type)
+
+        else:
+            # Online key rotated
+            # TODO: Lock all add/remove targets
+            self._persist(new_root, Root.type)
+            self.bump_online_roles(force=True)
+            # TODO: Unlock all add/remove targets
