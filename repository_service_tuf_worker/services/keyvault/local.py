@@ -57,19 +57,24 @@ class LocalKeyVault(IKeyVault):
         Run actions to check and configure the service using the settings.
         """
         # Check that the online key can be loaded without an error.
-        try:
-            path = settings.LOCAL_KEYVAULT_PATH
-            password: str
-            if settings.LOCAL_KEYVAULT_PASSWORD.startswith("/run/secrets/"):
-                # The user has stored their password using container secrets.
-                with open(settings.LOCAL_KEYVAULT_PASSWORD) as f:
-                    password = f.read().rstrip("\n")
-            else:
-                password = settings.LOCAL_KEYVAULT_PASSWORD
+        path = settings.LOCAL_KEYVAULT_PATH
+        keys_path = path.split(":")
+        count_loaded_keys: int = 0
+        password: str
+        if settings.LOCAL_KEYVAULT_PASSWORD.startswith("/run/secrets/"):
+            # The user has stored their password using container secrets.
+            with open(settings.LOCAL_KEYVAULT_PASSWORD) as f:
+                password = f.read().rstrip("\n")
+        else:
+            password = settings.LOCAL_KEYVAULT_PASSWORD
 
-            import_privatekey_from_file(
-                path, settings.LOCAL_KEYVAULT_TYPE, password
-            )
+        try:
+            for key_path in keys_path:
+                import_privatekey_from_file(
+                    key_path, settings.LOCAL_KEYVAULT_TYPE, password
+                )
+                count_loaded_keys += 1
+                logging.info(f"Online key loaded {key_path}")
         except (
             FormatError,
             ValueError,
@@ -77,8 +82,11 @@ class LocalKeyVault(IKeyVault):
             StorageError,
             Error,
         ) as e:
-            logging.error(str(e))
-            raise KeyVaultError(f"Cannot read private key file {path}") from e
+            logging.info(str(e))
+
+        if count_loaded_keys == 0:
+            raise KeyVaultError(f"Cannot read private key(s) {path}")
+
 
     @classmethod
     def settings(cls) -> List[ServiceSettings]:
