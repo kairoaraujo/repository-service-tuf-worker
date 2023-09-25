@@ -1,4 +1,4 @@
-# Default development deployment
+# Development deployment using Redis as Broker
 version: "3.9"
 
 volumes:
@@ -10,21 +10,9 @@ volumes:
   repository-service-tuf-pgsql-data:
 
 services:
-  rabbitmq:
-    image: rabbitmq:3.10.7-management-alpine
-    volumes:
-     - "repository-service-tuf-mq-data:/var/lib/rabbitmq"
-    ports:
-      - 5672:5672
-      - 15672:15672
-    healthcheck:
-      test: "exit 0"
-    restart: always
-
   postgres:
     image: postgres:15.1
     ports:
-      # 5432 may already in use by another PostgreSQL on host
       - "5433:5432"
     environment:
       - POSTGRES_PASSWORD=secret
@@ -41,8 +29,8 @@ services:
     ports:
       - 80:80
     environment:
-      - RSTUF_BROKER_SERVER="amqp://guest:guest@rabbitmq:5672"
-      - RSTUF_REDIS_SERVER="redis://redis"
+      - RSTUF_BROKER_SERVER=redis://redis
+      - RSTUF_REDIS_SERVER=redis://redis
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -73,10 +61,8 @@ services:
       - RSTUF_LOCAL_STORAGE_BACKEND_PATH=/var/opt/repository-service-tuf/storage
       - RSTUF_LOCAL_KEYVAULT_PATH=/opt/repository-service-tuf-worker/tests/files/key_storage
       - RSTUF_LOCAL_KEYVAULT_KEYS=online.key,strongPass:online-rsa.key,strongPass,rsa
-      - RSTUF_BROKER_SERVER=amqp://guest:guest@rabbitmq:5672
-      - RSTUF_SQL_SERVER=postgres:5432
-      - RSTUF_SQL_USER=postgres
-      - RSTUF_SQL_PASSWORD=secret
+      - RSTUF_BROKER_SERVER=redis://redis
+      - RSTUF_SQL_SERVER=postgres:secret@postgres:5432
       - RSTUF_REDIS_SERVER=redis://redis
     volumes:
       - ./:/opt/repository-service-tuf-worker:z

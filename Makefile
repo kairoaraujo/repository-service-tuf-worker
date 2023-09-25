@@ -3,6 +3,7 @@
 build-dev:
 	docker build -t repository-service-tuf-worker:dev .
 
+run-dev: export API_VERSION = dev
 run-dev:
 	$(MAKE) build-dev
 	docker pull ghcr.io/repository-service-tuf/repository-service-tuf-api:dev
@@ -53,3 +54,20 @@ precommit:
 	pre-commit install
 	pre-commit autoupdate
 	pre-commit run --all-files --show-diff-on-failure
+
+clone-umbrella:
+	rm -rf rstuf-umbrella
+	git clone --branch remove_ft_gha_workflows https://github.com/repository-service-tuf/repository-service-tuf.git rstuf-umbrella
+
+
+ft-das:
+ifeq ($(GITHUB_ACTION),)
+	$(MAKE) clone-umbrella
+endif
+	docker compose run --env UMBRELLA_PATH=rstuf-umbrella --entrypoint 'bash rstuf-umbrella/tests/functional/scripts/run-ft-das.sh $(CLI_VERSION)' --rm repository-service-tuf-worker
+
+ft-signed:
+ifeq ($(GITHUB_ACTION),)
+	$(MAKE) clone-umbrella
+endif
+	docker compose run --env UMBRELLA_PATH=rstuf-umbrella --entrypoint 'bash rstuf-umbrella/tests/functional/scripts/run-ft-signed.sh $(CLI_VERSION)' --rm repository-service-tuf-worker
