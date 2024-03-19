@@ -375,7 +375,7 @@ class MetadataRepository:
 
         return snapshot.signed.version
 
-    def _get_role_for_target_path(self, target_path: str) -> str:
+    def _get_role_for_target_path(self, target_path: str) -> Optional[str]:
         """
         Return role name by target file path
         """
@@ -385,7 +385,11 @@ class MetadataRepository:
         # for this target path, but we get the first match. If we want to get
         # the most specific one we need to use _preorder_depth_first_walk
         # of the ngclient Updater class in python-tuf.
-        role_name, _ = next(delegations.get_roles_for_target(target_path))
+        try:
+            role_name, _ = next(delegations.get_roles_for_target(target_path))
+        except StopIteration:
+            return None
+
         return role_name
 
     def _update_task(
@@ -906,8 +910,16 @@ class MetadataRepository:
         # Group target files by responsible delegated role.
         # This will be used to by `_update_task` for updating task status.
         bin_targets: Dict[str, List[targets_models.RSTUFTargetFiles]] = {}
+        # targets without delegated target path
+        not_found_targets: List[str] = []
+        # added targets
+        added_targets: List[str] = []
+
         for target in targets:
             delegated_role = self._get_role_for_target_path(target["path"])
+            if delegated_role is None:
+                not_found_targets.append(target["path"])
+                continue
             db_target_file = targets_crud.read_file_by_path(
                 self._db, target.get("path")
             )
@@ -936,28 +948,30 @@ class MetadataRepository:
                 bin_targets[delegated_role] = []
 
             bin_targets[delegated_role].append(db_target_file)
+            added_targets.append(target["path"])
+
 
         # If publish_targets doesn't exists it will be True by default.
         publish_targets = payload.get("publish_targets", True)
         subtask = None
-        if publish_targets is True:
+        if publish_targets is True and len(added_targets) > 0:
             subtask = self._send_publish_targets_task(
                 task_id, [bins_role for bins_role in bin_targets]
             )
 
         self._update_task(bin_targets, update_state, subtask)
 
-        add_targets = [target.get("path") for target in targets]
         update_roles = [t_role for t_role in bin_targets]
 
-        logging.debug(f"Added targets: {add_targets} on Roles {update_roles}")
+        logging.debug(f"Added targets: {added_targets} on Roles {update_roles}")
         return self._task_result(
             task=TaskName.ADD_TARGETS,
             message="Target(s) Added",
             error=None,
             details={
-                "targets": add_targets,
+                "targets": added_targets,
                 "target_roles": update_roles,
+                "invalid_paths": not_found_targets,
             },
         )
 
@@ -993,6 +1007,10 @@ class MetadataRepository:
         bin_targets: Dict[str, List[targets_models.RSTUFTargetFiles]] = {}
         for target in targets:
             delegated_role = self._get_role_for_target_path(target)
+            if delegated_role is None:
+                not_found_targets.append(target)
+                continue
+
             db_target = targets_crud.read_file_by_path(self._db, target)
             if db_target is None or (
                 db_target.action == targets_schema.TargetAction.REMOVE
