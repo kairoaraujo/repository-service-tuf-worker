@@ -375,6 +375,36 @@ class MetadataRepository:
 
         return snapshot.signed.version
 
+    def _update_targets(
+        self, new_root: Optional[Metadata[Root]]
+    ) -> Metadata[Targets]:
+        """
+        Update targets metadata with new targets.
+
+        Args:
+            new_root: New root metadata to update the targets metadata.
+        """
+        current_root = self._storage_backend.get(Root.type)
+        targets = self._storage_backend.get(Targets.type)
+
+        delegated_roles = self._settings.get_fresh("DELEGATED_ROLES_NAMES")
+        bins_used = True if delegated_roles[0].startswith("bins") else False
+        old_online_keyid = current_root.signed.roles[Targets.type].keyids[0]
+        new_online_keyid = new_root.signed.roles[Timestamp.type].keyids[0]
+        if bins_used:
+            targets.signed.revoke_key(old_online_keyid)
+            targets.signed.add_key(new_root.signed.keys[new_online_keyid])
+
+        else:
+            for role in delegated_roles:
+                targets.signed.revoke_key(old_online_keyid, role)
+                targets.signed.add_key(
+                    new_root.signed.keys[new_online_keyid], role
+                )
+
+
+        return targets
+
     def _get_role_for_artifact_path(self, artifact_path: str) -> Optional[str]:
         """
         Return role name by target file path
@@ -1301,15 +1331,16 @@ class MetadataRepository:
             status_lock_targets = False
             try:
                 with self._redis.lock(LOCK_TARGETS, timeout=self._timeout):
-                    # root metadata and online key are updated
-                    # 1. persist the new root
-                    # 2. bump all target roles
-                    self._persist(new_root, Root.type)
+                    logging.info("Bumping and persisting new Targets metadata")
+                    self._bump_and_persist(
+                        self._update_targets(new_root), Targets.type
+                    )
                     logging.info(
                         f"Updating root metadata: {new_root.signed.version}"
                     )
-                    self._run_online_roles_bump(force=True)
+                    self._persist(new_root, Root.type)
                     logging.info("Updating all targets metadata")
+                    self._run_online_roles_bump(force=True)
                     status_lock_targets = True
             except redis.exceptions.LockNotOwnedError:
                 if status_lock_targets is False:
