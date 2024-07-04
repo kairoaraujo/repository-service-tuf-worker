@@ -17,7 +17,7 @@ from celery.app.task import Task
 from celery.exceptions import ChordError
 from celery.result import AsyncResult, states
 from dynaconf.loaders import redis_loader
-from securesystemslib.exceptions import UnverifiedSignatureError
+from securesystemslib.exceptions import StorageError, UnverifiedSignatureError
 from securesystemslib.signer import (
     KEY_FOR_TYPE_AND_SCHEME,
     Key,
@@ -102,6 +102,7 @@ class TaskName(str, enum.Enum):
     PUBLISH_ARTIFACTS = "publish_artifacts"
     FORCE_ONLINE_METADATA_UPDATE = "force_online_metadata_update"
     METADATA_UPDATE = "metadata_update"
+    METADATA_DELEGATION = "metadata_delegation"
     SIGN_METADATA = "sign_metadata"
     DELETE_SIGN_METADATA = "delete_sign_metadata"
 
@@ -267,6 +268,11 @@ class MetadataRepository:
             if role_name == Root.type:
                 self.write_repository_settings("TRUSTED_ROOT", role.to_dict())
 
+            if role_name == Targets.type:
+                self.write_repository_settings(
+                    f"TRUSTED_TARGETS", role.to_dict()
+                )
+
         bytes_data = role.to_bytes(JSONSerializer())
         self._storage_backend.put(bytes_data, filename)
         logging.debug(f"{filename} saved")
@@ -351,9 +357,19 @@ class MetadataRepository:
 
             for db_role in db_target_roles:
                 rolename = db_role.rolename
-                delegation: Metadata[Targets] = self._storage_backend.get(
-                    rolename
-                )
+                try:
+                    delegation: Metadata[Targets] = self._storage_backend.get(
+                        rolename
+                    )
+                except StorageError as err:
+                    if self._settings.get_fresh(f"{rolename.upper()}_SIGNING"):
+                        delegation = Metadata[Targets].from_dict(
+                            self._settings.get_fresh(
+                                f"{rolename.upper()}_SIGNING"
+                            )
+                        )
+                    else:
+                        raise err
                 delegation.signed.targets.clear()
                 delegation.signed.targets = {
                     file.path: TargetFile.from_dict(file.info, file.path)
@@ -368,20 +384,44 @@ class MetadataRepository:
                     # will return None for this specific role.
                 }
                 delegation_name = BINS if bins_used else rolename
-                # update expiry, bump version and persist to the storage
-                self._bump_and_persist(
-                    delegation, delegation_name, persist=False
-                )
-                self._persist(delegation, rolename)
+
                 # update targetfile in db
                 # note: It update only if is not published see the CRUD.
                 targets_crud.update_files_to_published(
                     self._db, [file.path for file in db_role.target_files]
                 )
 
-                snapshot.signed.meta[f"{rolename}.json"] = MetaFile(
-                    version=delegation.signed.version
-                )
+                role_keyids = targets.signed.delegations.roles[rolename].keyids
+                if (
+                    len(role_keyids) == 1
+                    and self._online_key.keyid in role_keyids
+                ):
+                    # full online delegation
+                    # update expiry, bump version and persist to the storage
+                    self._bump_and_persist(
+                        delegation, delegation_name, persist=False
+                    )
+                    self._persist(delegation, rolename)
+                    snapshot.signed.meta[f"{rolename}.json"] = MetaFile(
+                        version=delegation.signed.version
+                    )
+
+                elif (
+                    len(role_keyids) > 1
+                    and self._online_key.keyid in role_keyids
+                ):
+                    # online and offline delegation
+                    self._sign(delegation)
+                    self.write_repository_settings(
+                        f"{rolename.upper()}_SIGNING", delegation.to_dict()
+                    )
+
+                else:
+                    # full offline delegation
+                    delegation.signatures.clear()
+                    self.write_repository_settings(
+                        f"{rolename.upper()}_SIGNING", delegation.to_dict()
+                    )
 
             roles = "".join(target_roles)
             msg = f"Bumped all expired target delegation roles: {roles}"
@@ -595,21 +635,8 @@ class MetadataRepository:
             )
 
         else:
-            delegated_roles = roles_info["delegated_roles"]
-            self.write_repository_settings(
-                "CUSTOM_DELEGATED_ROLES", delegated_roles
-            )
-            for deleg_name, deleg_info in delegated_roles.items():
-                name = deleg_name.upper()
-                self.write_repository_settings(
-                    f"{name}_EXPIRATION", deleg_info["expiration"]
-                )
-                self.write_repository_settings(f"{name}_THRESHOLD", 1)
-                self.write_repository_settings(f"{name}_NUM_KEYS", 1)
-                self.write_repository_settings(
-                    f"{name}_PATH_PATTERNS",
-                    delegated_roles[deleg_name]["path_patterns"],
-                )
+            delegations = {"delegations": roles_info.get("delegations")}
+            self.write_repository_settings("DELEGATIONS", delegations)
 
     def _setup_targets_delegations(
         self,
@@ -663,7 +690,6 @@ class MetadataRepository:
     def _bootstrap_online_roles(
         self,
         root: Metadata[Root],
-        custom_targets: Optional[Dict[str, Any]] = None,
     ):
         """
         Bootstrap the roles that uses the online key
@@ -675,18 +701,8 @@ class MetadataRepository:
 
         _keyid: str = root.signed.roles[Timestamp.type].keyids[0]
         public_key = root.signed.keys[_keyid]
-        self._setup_targets_delegations(public_key, targets, custom_targets)
 
         db_target_roles: List[targets_schema.RSTUFTargetRoleCreate] = []
-        delegated_names = self._settings.get_fresh("DELEGATED_ROLES_NAMES")
-        for role_name in delegated_names:
-            snapshot.signed.meta[f"{role_name}.json"] = MetaFile()
-
-            db_target_roles.append(
-                targets_schema.RSTUFTargetRoleCreate(
-                    rolename=role_name, version=1
-                )
-            )
 
         targets_crud.create_roles(self._db, db_target_roles)
         snapshot.signed.meta[f"{Targets.type}.json"] = MetaFile()
@@ -724,17 +740,16 @@ class MetadataRepository:
         """
         Register the bootstrap finished.
         """
-        custom_delegated_roles: Dict[str, Any] = self._settings.get_fresh(
-            "CUSTOM_DELEGATED_ROLES"
-        )
+        delegations: Dict[str, Any] = self._settings.get_fresh("DELEGATIONS")
         # All roles except root share the same one key and it doesn't matter
         # from which role we will get the key.
         keyid: str = root.signed.roles["timestamp"].keyids[0]
         self._online_key = root.signed.keys[keyid]
-        self._bootstrap_online_roles(root, custom_delegated_roles)
+        self._bootstrap_online_roles(root)
         self.write_repository_settings("ROOT_SIGNING", None)
         self._persist(root, Root.type)
         self.write_repository_settings("BOOTSTRAP", task_id)
+        self.metadata_delegation(delegations)
 
     def bootstrap(
         self,
@@ -1572,11 +1587,104 @@ class MetadataRepository:
 
         return self.metadata_update(payload, update_state)
 
+    def metadata_delegation(
+        self,
+        payload: Dict[str, Any],
+        update_state: Optional[
+            Task.update_state
+        ] = None,  # It is required (see: app.py)
+    ) -> Dict[str, Any]:
+        """Create a custom delegation role"""
+
+        success_delegated = []
+        failed_delegated = []
+        # load the Targets role
+        delegations: Delegations = Delegations.from_dict(
+            payload["delegations"]
+        )
+        targets = self._storage_backend.get(Targets.type)
+        if targets.signed.delegations is None:
+            targets.signed.delegations = Delegations(keys={}, roles={})
+
+        for key in delegations.keys:
+            if key not in targets.signed.delegations.keys:
+                targets.signed.delegations.keys[key] = delegations.keys[key]
+
+        for role in delegations.roles:
+            if targets.signed.delegations.roles is None:
+                targets.signed.delegations.roles = {}
+
+            if role in targets.signed.delegations.roles:
+                failed_delegated.append(role)
+                continue
+
+            # create delegated target role
+            delegated_target = Metadata(Targets(version=1))
+
+            # save expiration settings
+            expires = delegations.roles[role].unrecognized_fields[
+                "x-rstuf-expire-policy"
+            ]
+            self.write_repository_settings(
+                f"{role.upper()}_EXPIRATION", expires
+            )
+
+            # add keys to the delegated target role
+            # if no key is assigned, use the online key
+            if (
+                len(delegations.roles[role].keyids) == 0
+                and delegations.roles[role].threshold > 1
+            ):
+                raise RepositoryError(
+                    "If no keys are assigned, threshold must be 1"
+                )
+
+            if len(delegations.roles[role].keyids) == 0:
+                delegations.roles[role].keyids.append(self._online_key.keyid)
+
+            for keyid in delegations.roles[role].keyids:
+                if keyid == self._online_key.keyid:
+                    self._sign(delegated_target)
+
+            if role not in targets.signed.delegations.roles:
+                targets.signed.delegations.roles[role] = delegations.roles[
+                    role
+                ]
+
+            # verify the new role signatures
+            if self._validate_threshold(delegated_target, targets, role):
+                self._persist(delegated_target, role)
+
+            else:
+                self.write_repository_settings(
+                    f"{role.upper()}_SIGNING", delegated_target.to_dict()
+                )
+
+            success_delegated.append(role)
+            db_role = targets_schema.RSTUFTargetRoleCreate(
+                rolename=role, version=delegated_target.signed.version
+            )
+            targets_crud.create_roles(self._db, [db_role])
+
+        self._bump_and_persist(targets, Targets.type)
+        self._update_snapshot(target_roles=[Targets.type])
+
+        return self._task_result(
+            task=TaskName.METADATA_DELEGATION,
+            message="Metadata Delegation Processed",
+            error=None,
+            details={
+                "delegated_roles": success_delegated,
+                "failed_delegated": failed_delegated,
+            },
+        )
+
     @staticmethod
     def _validate_signature(
         metadata: Metadata,
         signature: Signature,
         delegator: Optional[Metadata] = None,
+        rolename: Optional[str] = Root.type,
     ) -> bool:
         """
         Validate signature over metadata using appropriate delegator.
@@ -1586,11 +1694,24 @@ class MetadataRepository:
             delegator = metadata
 
         keyid = signature.keyid
-        if keyid not in delegator.signed.roles[Root.type].keyids:
+        keyids: List[str] = []
+        if metadata.signed.type == Root.type:
+            keyids = delegator.signed.roles.get(rolename).keyids
+            key = delegator.signed.keys.get(signature.keyid)
+
+        elif metadata.signed.type == Targets.type:
+            keyids = delegator.signed.delegations.roles.get(rolename).keyids
+            key = delegator.signed.delegations.keys.get(signature.keyid)
+
+        else:
+            raise RepositoryError(
+                f"Unsupported metadata type: {metadata.signed.Type}"
+            )
+
+        if keyid not in keyids:
             logging.info(f"signature '{keyid}' not authorized")
             return False
 
-        key = delegator.signed.keys.get(signature.keyid)
         if not key:
             logging.info(f"no key for signature '{keyid}'")
             return False
@@ -1608,7 +1729,9 @@ class MetadataRepository:
 
     @staticmethod
     def _validate_threshold(
-        metadata: Metadata, delegator: Optional[Metadata] = None
+        metadata: Metadata,
+        delegator: Optional[Metadata] = None,
+        delegated_role: Optional[str] = Root.type,
     ) -> bool:
         """
         Validate signature threshold using appropriate delegator(s).
@@ -1618,7 +1741,7 @@ class MetadataRepository:
             delegator = metadata
 
         try:
-            delegator.verify_delegate(Root.type, metadata)
+            delegator.verify_delegate(delegated_role, metadata)
 
         except UnsignedMetadataError as e:
             logging.info(e)
@@ -1668,26 +1791,18 @@ class MetadataRepository:
         signature = Signature.from_dict(payload["signature"])
         rolename = payload["role"]
 
-        # Assert requested metadata type is root
-        if rolename != Root.type:
-            msg = f"Expected '{Root.type}', got '{rolename}'"
-            return _result(False, error=msg)
-
         # Assert pending signing event exists
-        metadata_dict = self._settings.get_fresh("ROOT_SIGNING")
+        metadata_dict = self._settings.get_fresh(f"{rolename.upper()}_SIGNING")
         if metadata_dict is None:
-            msg = "No signatures pending for root"
+            msg = f"No signatures pending for {rolename}"
             return _result(False, error=msg)
 
         # Assert metadata type is root
-        root = Metadata.from_dict(metadata_dict)
-        if not isinstance(root.signed, Root):
-            msg = f"Expected 'root', got '{root.signed.type}'"
-            return _result(False, error=msg)
+        metadata = Metadata.from_dict(metadata_dict)
 
         # If it isn't a "bootstrap" signing event, it must be "update metadata"
         bootstrap_state = self._settings.get_fresh("BOOTSTRAP")
-        if "signing" in bootstrap_state:
+        if metadata.signed.type == Root.type and "signing" in bootstrap_state:
             # Signature and threshold of initial root can only self-validate,
             # there is no "trusted root" at bootstrap time yet.
             if not self._validate_signature(root, signature):
@@ -1703,7 +1818,7 @@ class MetadataRepository:
             self._bootstrap_finalize(root, bootstrap_task_id)
             return _result(True, bootstrap="Bootstrap Finished")
 
-        else:
+        elif metadata.signed.type == Root.type:
             # We need the "trusted root" when updating to a new root:
             # - signature could come from a key, which is only in the trusted
             #   root, OR from a key, which is only in the new root
@@ -1730,6 +1845,36 @@ class MetadataRepository:
             self._root_metadata_update_finalize(trusted_root, root)
             self.write_repository_settings("ROOT_SIGNING", None)
             return _result(True, update="Metadata update finished")
+
+        else:
+            # We need the "trusted root" when updating to a new root:
+            # - signature could come from a key, which is only in the trusted
+            #   root, OR from a key, which is only in the new root
+            # - threshold must validate with the threshold of keys as defined
+            #   in the trusted root AND as defined in the new root
+            targets = self._storage_backend.get(Targets.type)
+            is_valid_trusted = self._validate_signature(
+                metadata, signature, targets, rolename
+            )
+
+            if not is_valid_trusted:
+                return _result(False, error="Invalid signature")
+
+            metadata.signatures[signature.keyid] = signature
+            trusted_threshold = self._validate_threshold(
+                metadata, targets, rolename
+            )
+            if not trusted_threshold:
+                self.write_repository_settings(
+                    f"{rolename.upper()}_SIGNING", metadata.to_dict()
+                )
+                msg = f"{rolename} v{metadata.signed.version} is pending signatures"
+                return _result(True, update=msg)
+
+            # Threshold reached -> finalize event
+            self._persist(metadata, rolename)
+            self.write_repository_settings(f"{rolename.upper()}_SIGNING", None)
+            return _result(True, update=f"Role {rolename} signing complete")
 
     def delete_sign_metadata(
         self,
