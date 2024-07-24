@@ -696,6 +696,8 @@ class MetadataRepository:
         """
         # Top level roles (`Targets`, `Timestamp``, `Snapshot`) initialization
         targets: Metadata[Targets] = Metadata(Targets())
+        targets.signed.delegations = Delegations({}, {})
+        targets.signed.delegations.keys[self._online_key.keyid] = self._online_key
         snapshot: Metadata[Snapshot] = Metadata(Snapshot())
         timestamp: Metadata[Timestamp] = Metadata(Timestamp())
 
@@ -1590,11 +1592,15 @@ class MetadataRepository:
     def metadata_delegation(
         self,
         payload: Dict[str, Any],
+        targets: Optional[Metadata[Targets]] = None,
         update_state: Optional[
             Task.update_state
         ] = None,  # It is required (see: app.py)
     ) -> Dict[str, Any]:
         """Create a custom delegation role"""
+
+        if targets is None:
+            targets = self._storage_backend.get(Targets.type)
 
         success_delegated = []
         failed_delegated = []
@@ -1602,7 +1608,7 @@ class MetadataRepository:
         delegations: Delegations = Delegations.from_dict(
             payload["delegations"]
         )
-        targets = self._storage_backend.get(Targets.type)
+
         if targets.signed.delegations is None:
             targets.signed.delegations = Delegations(keys={}, roles={})
 
@@ -1666,8 +1672,9 @@ class MetadataRepository:
             )
             targets_crud.create_roles(self._db, [db_role])
 
+        success_delegated.append(Targets.type)
         self._bump_and_persist(targets, Targets.type)
-        self._update_snapshot(target_roles=[Targets.type])
+        self._update_snapshot(target_roles=success_delegated)
 
         return self._task_result(
             task=TaskName.METADATA_DELEGATION,
@@ -1805,17 +1812,17 @@ class MetadataRepository:
         if metadata.signed.type == Root.type and "signing" in bootstrap_state:
             # Signature and threshold of initial root can only self-validate,
             # there is no "trusted root" at bootstrap time yet.
-            if not self._validate_signature(root, signature):
+            if not self._validate_signature(metadata, signature):
                 return _result(False, error="Invalid signature")
 
-            root.signatures[signature.keyid] = signature
-            if not self._validate_threshold(root):
-                self.write_repository_settings("ROOT_SIGNING", root.to_dict())
-                msg = f"Root v{root.signed.version} is pending signatures"
+            metadata.signatures[signature.keyid] = signature
+            if not self._validate_threshold(metadata):
+                self.write_repository_settings("ROOT_SIGNING", metadata.to_dict())
+                msg = f"Root v{metadata.signed.version} is pending signatures"
                 return _result(True, bootstrap=msg)
 
             bootstrap_task_id = bootstrap_state.split("signing-")[1]
-            self._bootstrap_finalize(root, bootstrap_task_id)
+            self._bootstrap_finalize(metadata, bootstrap_task_id)
             return _result(True, bootstrap="Bootstrap Finished")
 
         elif metadata.signed.type == Root.type:
