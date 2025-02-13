@@ -152,7 +152,7 @@ class AWSS3(IStorage):
         """
         try:
             self._s3_client.put_object(
-                Body=data, Bucket=self._bucket, Key=filename
+                Body=data, Bucket=self._bucket, Key=filename, ACL="public-read"
             )
         except ClientError:
             raise StorageError(f"Can't write role file '{filename}'")
